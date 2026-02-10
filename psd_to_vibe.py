@@ -4,6 +4,14 @@ import re
 from datetime import datetime
 from psd_tools import PSDImage
 from PIL import Image
+import logging
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # 配置
 PSD_FILE = '1920_new.psd'
@@ -55,6 +63,12 @@ def extract_effects(layer):
                         "angle": getattr(effect, 'angle', 0),
                         "choke": getattr(effect, 'choke', 0)
                     }
+                    # 提取阴影颜色
+                    if hasattr(effect, 'color'):
+                        color = effect.color
+                        r, g, b = color.red, color.green, color.blue
+                        effect_data["color"] = f"#{r:02x}{g:02x}{b:02x}"
+                        design_tokens["colors"].add(f"#{r:02x}{g:02x}{b:02x}")
                     effects["shadow"] = effect_data
 
                 # 发光效果
@@ -65,6 +79,11 @@ def extract_effects(layer):
                         "size": getattr(effect, 'size', 0),
                         "spread": getattr(effect, 'spread', 0)
                     }
+                    if hasattr(effect, 'color'):
+                        color = effect.color
+                        r, g, b = color.red, color.green, color.blue
+                        effect_data["color"] = f"#{r:02x}{g:02x}{b:02x}"
+                        design_tokens["colors"].add(f"#{r:02x}{g:02x}{b:02x}")
                     effects["glow"] = effect_data
 
                 # 描边
@@ -75,6 +94,12 @@ def extract_effects(layer):
                         "opacity": getattr(effect, 'opacity', 255) / 255.0,
                         "position": str(getattr(effect, 'position', 'center'))
                     }
+                    # 提取描边颜色
+                    if hasattr(effect, 'color'):
+                        color = effect.color
+                        r, g, b = color.red, color.green, color.blue
+                        effect_data["color"] = f"#{r:02x}{g:02x}{b:02x}"
+                        design_tokens["colors"].add(f"#{r:02x}{g:02x}{b:02x}")
                     effects["stroke"] = effect_data
 
                 # 渐变叠加
@@ -135,6 +160,7 @@ def extract_text_styles(layer):
         if hasattr(layer, 'engine_dict'):
             run_array = layer.engine_dict.get('StyleRun', {}).get('RunArray', [])
             if run_array:
+                # 处理第一个文字样式（主要样式）
                 style = run_array[0].get('StyleSheet', {}).get('StyleSheetData', {})
 
                 # 字体大小
@@ -185,6 +211,28 @@ def extract_text_styles(layer):
                 if tracking is not None:
                     styles["letter_spacing"] = float(tracking) / 1000.0
 
+                # 文字对齐方式
+                para_style = layer.engine_dict.get('ParagraphRun', {}).get('RunArray', [{}])[0] \
+                    .get('ParagraphSheet', {}).get('Properties', {})
+
+                if 'Justification' in para_style:
+                    justification_map = {
+                        'left': 'left',
+                        'center': 'center',
+                        'right': 'right',
+                        'justify': 'justify'
+                    }
+                    justification = str(para_style['Justification']).lower()
+                    styles["text_align"] = justification_map.get(justification, 'left')
+
+                # 换行设置
+                if 'AutoHyphenate' in para_style:
+                    styles["hyphens"] = "auto" if para_style['AutoHyphenate'] else "none"
+
+                # 如果有多个不同样式，标记出来
+                if len(run_array) > 1:
+                    styles["has_rich_text"] = True
+
     except Exception as e:
         pass
 
@@ -194,6 +242,47 @@ def extract_fill_info(layer):
     """提取填充信息"""
     fill = {}
     try:
+        # 从 vector_mask 获取圆角和形状信息
+        if hasattr(layer, 'vector_mask') and layer.vector_mask:
+            mask = layer.vector_mask
+            if hasattr(mask, 'paths'):
+                for path in mask.paths:
+                    if hasattr(path, 'corners') and path.corners:
+                        # 提取圆角半径（使用所有角中的最小值或平均值）
+                        radius_values = []
+                        for corner in path.corners:
+                            if hasattr(corner, 'radius'):
+                                radius_values.append(float(corner.radius))
+                        if radius_values:
+                            avg_radius = sum(radius_values) / len(radius_values)
+                            if avg_radius > 0:
+                                fill["border_radius"] = round(avg_radius, 1)
+                                design_tokens["spacings"].add(int(avg_radius))
+
+            # 提取描边样式
+            if hasattr(mask, 'stroke_setting'):
+                stroke = mask.stroke_setting
+                if stroke and hasattr(stroke, 'enabled') and stroke.enabled:
+                    stroke_info = {
+                        "width": float(getattr(stroke, 'stroke_width', 1)),
+                        "enabled": True
+                    }
+
+                    # 提取描边颜色
+                    if hasattr(stroke, 'stroke_color'):
+                        color = stroke.stroke_color
+                        if hasattr(color, 'red') and hasattr(color, 'green') and hasattr(color, 'blue'):
+                            r, g, b = color.red, color.green, color.blue
+                            stroke_info["color"] = f"#{r:02x}{g:02x}{b:02x}"
+                            design_tokens["colors"].add(f"#{r:02x}{g:02x}{b:02x}")
+
+                    # 提取描边类型（虚线、实线等）
+                    if hasattr(stroke, 'stroke_style'):
+                        stroke_info["style"] = str(stroke.stroke_style).lower()
+
+                    fill["border"] = stroke_info
+                    design_tokens["spacings"].add(int(stroke_info["width"]))
+
         if hasattr(layer, 'resource_dict'):
             resources = layer.resource_dict
 
@@ -212,12 +301,69 @@ def extract_fill_info(layer):
                             fill["background_color"] = color_hex
                             design_tokens["colors"].add(color_hex)
 
-            # 渐变填充
+            # 渐变填充 - 提取完整渐变信息
             elif 'FillGradient' in resources:
-                fill["gradient"] = "gradient"
+                gradient = resources['FillGradient']
+                gradient_info = {
+                    "type": str(gradient.get('Type', 'linear')),
+                    "smoothness": gradient.get('Smoothness', 4096) / 4096.0,
+                }
+
+                # 渐变颜色停止点
+                if 'Gradient' in gradient:
+                    gradient_data = gradient['Gradient']
+
+                    # 渐变类型
+                    if 'Type' in gradient_data:
+                        gradient_info["gradient_type"] = str(gradient_data['Type'])
+
+                    # 颜色停止点
+                    if 'ColorStops' in gradient_data:
+                        stops = []
+                        for stop in gradient_data['ColorStops']:
+                            color = stop.get('Color', {})
+                            if 'Values' in color:
+                                values = color['Values']
+                                if len(values) >= 3:
+                                    r = int(values[0] * 255 / 65535)
+                                    g = int(values[1] * 255 / 65535)
+                                    b = int(values[2] * 255 / 65535)
+                                    color_hex = f"#{r:02x}{g:02x}{b:02x}"
+                                    stops.append({
+                                        "color": color_hex,
+                                        "location": stop.get('Location', 0) / 4096.0
+                                    })
+                                    design_tokens["colors"].add(color_hex)
+                        if stops:
+                            gradient_info["color_stops"] = sorted(stops, key=lambda x: x['location'])
+
+                    # 透明度停止点
+                    if 'TransparencyStops' in gradient_data:
+                        stops = []
+                        for stop in gradient_data['TransparencyStops']:
+                            stops.append({
+                                "opacity": stop.get('Opacity', 255) / 255.0,
+                                "location": stop.get('Location', 0) / 4096.0
+                            })
+                        if stops:
+                            gradient_info["opacity_stops"] = sorted(stops, key=lambda x: x['location'])
+
+                    # 渐变角度
+                    if 'Angle' in gradient_data:
+                        gradient_info["angle"] = float(gradient_data['Angle'])
+
+                    # 渐变模式
+                    if 'Mode' in gradient_data:
+                        gradient_info["mode"] = str(gradient_data['Mode'])
+
+                    # 渐变反转
+                    if 'Reverse' in gradient_data:
+                        gradient_info["reverse"] = gradient_data['Reverse']
+
+                fill["background_gradient"] = gradient_info
 
     except Exception as e:
-        pass
+        logger.debug(f"提取填充信息时出错: {e}")
 
     return fill if fill else None
 
@@ -249,7 +395,7 @@ def optimize_image(img_path):
     except Exception as e:
         pass
 
-def parse_layer(layer, index_prefix=""):
+def parse_layer(layer, index_prefix="", parent_bbox=None):
     """递归解析图层"""
     if not layer.visible:
         return None
@@ -268,9 +414,42 @@ def parse_layer(layer, index_prefix=""):
         "bbox": bbox
     }
 
-    # 收集间距信息
+    # 收集间距信息：提取有意义的间距值
+    # 1. 提取图层的左、上、右、下边界
     design_tokens["spacings"].add(int(layer.left))
     design_tokens["spacings"].add(int(layer.top))
+    design_tokens["spacings"].add(int(layer.width))
+    design_tokens["spacings"].add(int(layer.height))
+
+    # 2. 如果有父容器，计算内边距和外边距
+    if parent_bbox:
+        # 计算相对父容器的内边距
+        padding_left = int(layer.left - parent_bbox["left"])
+        padding_top = int(layer.top - parent_bbox["top"])
+        padding_right = int(parent_bbox["left"] + parent_bbox["width"] - (layer.left + layer.width))
+        padding_bottom = int(parent_bbox["top"] + parent_bbox["height"] - (layer.top + layer.height))
+
+        # 只收集正值的内边距
+        if padding_left >= 0:
+            design_tokens["spacings"].add(padding_left)
+        if padding_top >= 0:
+            design_tokens["spacings"].add(padding_top)
+        if padding_right >= 0:
+            design_tokens["spacings"].add(padding_right)
+        if padding_bottom >= 0:
+            design_tokens["spacings"].add(padding_bottom)
+
+    # 3. 提取圆角（如果有的话）
+    if hasattr(layer, 'vector_mask') and layer.vector_mask:
+        mask = layer.vector_mask
+        if hasattr(mask, 'paths'):
+            for path in mask.paths:
+                if hasattr(path, 'corners') and path.corners:
+                    for corner in path.corners:
+                        if hasattr(corner, 'radius'):
+                            radius = int(corner.radius)
+                            if radius > 0:
+                                design_tokens["spacings"].add(radius)
 
     # 提取混合模式和透明度
     blend_info = extract_blend_info(layer)
@@ -340,9 +519,13 @@ def parse_layer(layer, index_prefix=""):
         data["content_type"] = "container"
         children_data = []
 
-        for i, child in enumerate(layer):
-            child_result = parse_layer(child, f"{index_prefix}_{i}")
+        child_layers = list(layer)
+        child_count = len(child_layers)
+        for i, child in enumerate(child_layers):
+            child_result = parse_layer(child, f"{index_prefix}_{i}", bbox)
             if child_result:
+                # 添加子图层的 zIndex（倒序）
+                child_result["zIndex"] = child_count - i
                 children_data.append(child_result)
 
         if children_data:
@@ -370,9 +553,20 @@ def extract_design_tokens():
     # 过滤和排序颜色
     colors = sorted(list(design_tokens["colors"]))
 
-    # 分析常用间距
+    # 分析常用间距 - 只保留有意义的间距值
     spacings = sorted(list(design_tokens["spacings"]))
-    common_spacings = sorted(set([s for s in spacings if s > 0 and s < 200]))
+    # 过滤：去除0和过大的值，保留设计中常用的间距
+    common_spacings = sorted(set([
+        s for s in spacings
+        if 0 < s < 500  # 排除过大值
+    ]))
+
+    # 提取常见的设计间距（8的倍数或4的倍数）
+    design_spacings = []
+    for s in common_spacings:
+        # 常用的间距值：4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96等
+        if s <= 100:
+            design_spacings.append(s)
 
     # 分析字体大小
     font_sizes = sorted(list(design_tokens["font_sizes"]))
@@ -381,53 +575,116 @@ def extract_design_tokens():
         "colors": colors[:20],  # 最多20个主要颜色
         "fonts": list(design_tokens["fonts"]),
         "font_sizes": font_sizes,
-        "spacings": common_spacings[:15]  # 最多15个常用间距
+        "spacings": design_spacings[:20]  # 最多20个常用间距
     }
 
 def main():
     if not os.path.exists(PSD_FILE):
+        logger.error(f"找不到文件 '{PSD_FILE}'")
         print(f"❌ 错误: 找不到文件 '{PSD_FILE}'")
         return
 
-    print(f"🔄 正在加载 {PSD_FILE} ...")
-    psd = PSDImage.open(PSD_FILE)
+    try:
+        logger.info(f"正在加载 {PSD_FILE}")
+        print(f"🔄 正在加载 {PSD_FILE} ...")
+        psd = PSDImage.open(PSD_FILE)
 
-    print("🖼️  正在生成整体预览图...")
-    psd.composite().save(os.path.join(OUTPUT_DIR, 'full_preview.png'))
+        logger.info("正在生成整体预览图")
+        print("🖼️  正在生成整体预览图...")
+        psd.composite().save(os.path.join(OUTPUT_DIR, 'full_preview.png'))
 
-    print("🔍 正在解析图层结构并切图...")
-    structure = []
-    for i, layer in enumerate(psd):
-        res = parse_layer(layer, str(i))
-        if res:
-            structure.append(res)
+        logger.info("正在解析图层结构并切图")
+        print("🔍 正在解析图层结构并切图...")
+        structure = []
+        layer_count = len(list(psd))
+        for i, layer in enumerate(psd):
+            try:
+                res = parse_layer(layer, str(i))
+                if res:
+                    # 添加 zIndex 信息（倒序，顶层图层的 zIndex 值更大）
+                    res["zIndex"] = layer_count - i
+                    structure.append(res)
+            except Exception as e:
+                logger.error(f"解析图层 '{layer.name}' 时出错: {e}")
 
-    # 生成增强的 layout_data.json
-    json_path = os.path.join(OUTPUT_DIR, 'layout_data.json')
-    output_data = {
-        "metadata": {
-            "design_width": int(psd.width),
-            "design_height": int(psd.height),
-            "generated_at": datetime.now().isoformat(),
-            "psd_file": PSD_FILE
-        },
-        "design_tokens": extract_design_tokens(),
-        "layers": structure
-    }
+        # 生成增强的 layout_data.json
+        json_path = os.path.join(OUTPUT_DIR, 'layout_data.json')
+        output_data = {
+            "metadata": {
+                "design_width": int(psd.width),
+                "design_height": int(psd.height),
+                "generated_at": datetime.now().isoformat(),
+                "psd_file": PSD_FILE,
+                "total_layers": len(structure)
+            },
+            "design_tokens": extract_design_tokens(),
+            "layers": structure
+        }
 
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(output_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"保存元数据和图层结构到 {json_path}")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
 
-    # 保存单独的设计令牌文件
-    tokens_path = os.path.join(OUTPUT_DIR, 'design_tokens.json')
-    with open(tokens_path, 'w', encoding='utf-8') as f:
-        json.dump(extract_design_tokens(), f, indent=2, ensure_ascii=False)
+        # 拆分每个图层为独立的 JSON 文件
+        logger.info("正在拆分图层为独立文件...")
+        layers_dir = os.path.join(OUTPUT_DIR, 'layers')
+        os.makedirs(layers_dir, exist_ok=True)
 
-    print(f"✅ 处理完成！")
-    print(f"   - 元数据和图层结构: {json_path}")
-    print(f"   - 设计令牌: {tokens_path}")
-    print(f"   - 预览图: {OUTPUT_DIR}/full_preview.png")
-    print(f"   - 资源文件: {ASSETS_DIR}/")
+        for i, layer_data in enumerate(structure):
+            layer_name = safe_filename(layer_data.get("name", f"layer_{i}"))
+            layer_file = os.path.join(layers_dir, f"{i}_{layer_name}.json")
+
+            layer_output = {
+                "metadata": {
+                    "design_width": int(psd.width),
+                    "design_height": int(psd.height),
+                    "generated_at": datetime.now().isoformat(),
+                    "psd_file": PSD_FILE,
+                    "layer_index": i,
+                    "layer_name": layer_data.get("name")
+                },
+                "design_tokens": extract_design_tokens(),
+                "layer": layer_data
+            }
+
+            with open(layer_file, 'w', encoding='utf-8') as f:
+                json.dump(layer_output, f, indent=2, ensure_ascii=False)
+
+        # 生成图层索引文件
+        index_file = os.path.join(layers_dir, "index.json")
+        layer_index = {
+            "total_layers": len(structure),
+            "layers": [
+                {
+                    "index": i,
+                    "name": layer.get("name"),
+                    "file": f"{i}_{safe_filename(layer.get('name', f'layer_{i}'))}.json"
+                }
+                for i, layer in enumerate(structure)
+            ]
+        }
+        with open(index_file, 'w', encoding='utf-8') as f:
+            json.dump(layer_index, f, indent=2, ensure_ascii=False)
+
+        # 保存单独的设计令牌文件
+        tokens_path = os.path.join(OUTPUT_DIR, 'design_tokens.json')
+        logger.info(f"保存设计令牌到 {tokens_path}")
+        with open(tokens_path, 'w', encoding='utf-8') as f:
+            json.dump(extract_design_tokens(), f, indent=2, ensure_ascii=False)
+
+        logger.info("处理完成")
+        print(f"✅ 处理完成！")
+        print(f"   - 元数据和图层结构: {json_path}")
+        print(f"   - 单个图层文件: {layers_dir}/ (共 {len(structure)} 个)")
+        print(f"   - 图层索引: {layers_dir}/index.json")
+        print(f"   - 设计令牌: {tokens_path}")
+        print(f"   - 预览图: {OUTPUT_DIR}/full_preview.png")
+        print(f"   - 资源文件: {ASSETS_DIR}/")
+        print(f"   - 总图层数: {len(structure)}")
+
+    except Exception as e:
+        logger.error(f"处理 PSD 文件时出错: {e}", exc_info=True)
+        print(f"❌ 错误: {e}")
 
 if __name__ == '__main__':
     main()
